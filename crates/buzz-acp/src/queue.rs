@@ -1662,8 +1662,16 @@ fn format_context_hints(
                     s.push_str(&format!("\nParent: {parent}"));
                 }
             }
-            if let Some(event_id) = reply_anchor {
+        }
+        // Always tell the agent how to reply, whether this is a reply within
+        // an existing DM thread or the first message of a fresh DM (no root
+        // yet) — otherwise a fresh DM's first message never gets a reply
+        // instruction at all, and the agent silently never sends one.
+        if let Some(event_id) = reply_anchor {
+            if thread_tags.root_event_id.is_some() {
                 append_reply_instruction(&mut s, event_id);
+            } else {
+                append_new_thread_reply_instruction(&mut s, event_id);
             }
         }
         crate::prompt_framing::semantic_section("context", &s)
@@ -2037,10 +2045,11 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     // there. DMs are always 1:1 with a human, so they always anchor.
     let sender_pubkey = last_event.event.pubkey.to_hex();
     let reply_anchor = if is_dm {
-        thread_tags
-            .root_event_id
-            .is_some()
-            .then(|| last_event.event.id.to_hex())
+        // DMs are always 1:1 with a human, so they always anchor — including
+        // a DM's very first message, which has no thread root yet. Gating
+        // this on root_event_id.is_some() (as before) left a fresh DM with no
+        // anchor at all, so the agent was never told to reply.
+        Some(last_event.event.id.to_hex())
     } else {
         resolve_reply_anchor(
             &sender_pubkey,
@@ -4055,23 +4064,23 @@ mod tests {
                                 "Scope: channel"
                             }));
                         }
+                        // A fresh top-level message always opens a new
+                        // thread anchored at itself — DM or not. A DM reply
+                        // stays flat (anchors to the triggering event, not
+                        // the thread root); a non-DM nested reply anchors to
+                        // the thread root.
                         assert_eq!(
                             prompt.contains("This is a new top-level message"),
-                            !is_dm && !is_reply
+                            !is_reply
                         );
-                        if !is_dm || is_reply {
-                            let anchor = if is_dm {
-                                reply.id.to_hex()
-                            } else if is_reply {
-                                root.to_uppercase()
-                            } else {
-                                root.clone()
-                            };
-                            assert!(prompt.contains(&format!("--reply-to {anchor}")));
+                        let anchor = if !is_reply {
+                            root.clone()
+                        } else if is_dm {
+                            reply.id.to_hex()
                         } else {
-                            assert!(!prompt.contains("--reply-to"));
-                            assert!(prompt.contains("buzz messages get"));
-                        }
+                            root.to_uppercase()
+                        };
+                        assert!(prompt.contains(&format!("--reply-to {anchor}")));
                     }
                 }
             }
@@ -5353,9 +5362,15 @@ mod tests {
     }
 
     #[test]
-    fn test_reply_instruction_absent_for_dm_non_reply() {
+    fn test_reply_instruction_present_for_fresh_dm_first_message() {
+        // A DM's first message has no thread tags yet (root_event_id is
+        // None) — this must still get a reply instruction (anchored as a
+        // new thread), the same way a fresh top-level channel mention does.
+        // Regression test: this case previously fell through with no
+        // instruction at all, so the agent never sent a reply.
         let ch = Uuid::new_v4();
         let event = make_event("hey there");
+        let event_id = event.id.to_hex();
         let batch = FlushBatch {
             channel_id: ch,
             scope: conv(ch),
@@ -5383,8 +5398,8 @@ mod tests {
         )
         .join("\n\n");
         assert!(
-            !prompt.contains("--reply-to"),
-            "DM non-reply should NOT include reply instruction"
+            prompt.contains(&format!("--reply-to {event_id}")),
+            "fresh DM first message should anchor a new thread at the triggering event"
         );
     }
 
